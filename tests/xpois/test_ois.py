@@ -368,7 +368,7 @@ def _require_cutile() -> Any:
 
 def _sparse_rows_fixture(
     *,
-    component_count: int,
+    components: tuple[GaussianBasisComponent, ...],
     background_degree: int,
 ) -> tuple[np.ndarray, ...]:
     rng = np.random.default_rng(1219)
@@ -379,10 +379,7 @@ def _sparse_rows_fixture(
     variance = rng.uniform(0.25, 2.0, size=shape)
     mask = _default_fit_mask(shape, kernel_shape)
     mask &= rng.random(size=shape) < 0.61
-    basis, _ = build_gaussian_polynomial_basis(
-        kernel_shape,
-        _SPARSE_ROWS_COMPONENTS[:component_count],
-    )
+    basis, _ = build_gaussian_polynomial_basis(kernel_shape, components)
     background = background_design(shape, degree=background_degree)
     return reference, target, variance, mask, basis, background
 
@@ -393,16 +390,19 @@ def _sparse_rows_fixture(
     ids=["rows32", "rows128"],
 )
 @pytest.mark.parametrize(
-    ("component_count", "background_degree", "column_count"),
+    ("components", "background_degree", "column_count"),
     [
-        pytest.param(3, 0, 11, id="width16"),
-        pytest.param(2, 2, 15, id="width16-full"),
-        pytest.param(3, 2, 16, id="width32"),
+        # One degree-0 kernel plus a constant background is the smallest
+        # design the solver can build: two columns, MMA width 4.
+        pytest.param(_SPARSE_ROWS_COMPONENTS[2:], 0, 2, id="width4"),
+        pytest.param(_SPARSE_ROWS_COMPONENTS[:3], 0, 11, id="width16"),
+        pytest.param(_SPARSE_ROWS_COMPONENTS[:2], 2, 15, id="width16-full"),
+        pytest.param(_SPARSE_ROWS_COMPONENTS[:3], 2, 16, id="width32"),
     ],
 )
 def test_cutile_mma_normal_equations_match_cpu_for_sparse_rows(
     monkeypatch: pytest.MonkeyPatch,
-    component_count: int,
+    components: tuple[GaussianBasisComponent, ...],
     background_degree: int,
     column_count: int,
     large_tiles: bool,
@@ -417,7 +417,7 @@ def test_cutile_mma_normal_equations_match_cpu_for_sparse_rows(
         )
     reference, target, variance, mask, basis, background = (
         _sparse_rows_fixture(
-            component_count=component_count,
+            components=components,
             background_degree=background_degree,
         )
     )
@@ -450,7 +450,10 @@ def test_cutile_mma_kernel_signature_ignores_row_count(
 ) -> None:
     ct = _require_cutile()
     reference, target, variance, mask, basis, background = (
-        _sparse_rows_fixture(component_count=3, background_degree=0)
+        _sparse_rows_fixture(
+            components=_SPARSE_ROWS_COMPONENTS,
+            background_degree=0,
+        )
     )
     launches: list[tuple[Any, tuple[Any, ...]]] = []
     real_launch = ct.launch
@@ -489,6 +492,45 @@ def test_cutile_mma_kernel_signature_ignores_row_count(
     ]
     assert len(signatures) == 2
     assert signatures[0].parameters == signatures[1].parameters
+
+
+def test_cutile_padded_basis_is_cached_per_basis_contents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ct = _require_cutile()
+    reference, target, variance, mask, basis, background = (
+        _sparse_rows_fixture(
+            components=_SPARSE_ROWS_COMPONENTS,
+            background_degree=0,
+        )
+    )
+    other_basis, _ = build_gaussian_polynomial_basis(
+        basis.shape[1:],
+        _SPARSE_ROWS_COMPONENTS[:2],
+    )
+    padded_bases: list[Any] = []
+    real_launch = ct.launch
+
+    def recording_launch(stream, grid, kernel, kernel_args):
+        padded_bases.append(kernel_args[5])
+        return real_launch(stream, grid, kernel, kernel_args)
+
+    monkeypatch.setattr(ct, "launch", recording_launch)
+    # A fresh copy has a new identity but identical contents, so it must hit
+    # the cache; a different basis must not.
+    for fit_basis in (basis, basis.copy(), other_basis):
+        _accumulate_normal_equations_cutile(
+            reference,
+            target,
+            variance,
+            mask,
+            fit_basis,
+            background,
+        )
+
+    assert len(padded_bases) == 3
+    assert padded_bases[0] is padded_bases[1]
+    assert padded_bases[0] is not padded_bases[2]
 
 
 def test_solve_constant_kernel_rejects_unknown_backend() -> None:

@@ -1777,6 +1777,29 @@ def _cutile_mma_normal_equations_kernel() -> Any:
     return kernel
 
 
+@lru_cache(maxsize=8)
+def _cutile_padded_basis(
+    basis_bytes: bytes,
+    basis_shape: tuple[int, int, int],
+    padded_rows: int,
+    normal_width: int,
+) -> Any:
+    # Keyed on the basis contents rather than array identity: the solver
+    # rebuilds ``basis_kernels`` on every call, so identity never repeats.
+    cp, _ = _load_cutile()
+    basis_kernels = np.frombuffer(basis_bytes, dtype=np.float64).reshape(
+        basis_shape
+    )
+    kernel_size = basis_shape[1] * basis_shape[2]
+    padded_basis_host = np.zeros(
+        (padded_rows, normal_width), dtype=np.float64
+    )
+    padded_basis_host[:kernel_size, : basis_shape[0]] = (
+        basis_kernels[:, ::-1, ::-1].reshape(basis_shape[0], -1).T
+    )
+    return cp.asarray(padded_basis_host)
+
+
 def _accumulate_normal_equations_cutile(
     reference: np.ndarray,
     target: np.ndarray,
@@ -1811,19 +1834,18 @@ def _accumulate_normal_equations_cutile(
 
     kernel_height, kernel_width = basis_kernels.shape[1:]
     # cuda.tile MMA dimensions are powers of two. Reserve the next column
-    # after the design for the weighted target.
+    # after the design for the weighted target. ``ct.mma`` imposes no
+    # minimum N, so a two-column design runs at width 4.
     normal_width = 1 << column_count.bit_length()
     kernel_size = int(kernel_height * kernel_width)
     k_tile = _CUTILE_MMA_K_TILE
     k_tile_count = math.ceil(kernel_size / k_tile)
-    padded_basis_host = np.zeros(
-        (k_tile_count * k_tile, normal_width),
-        dtype=np.float64,
+    padded_basis = _cutile_padded_basis(
+        np.ascontiguousarray(basis_kernels, dtype=np.float64).tobytes(),
+        tuple(int(n) for n in basis_kernels.shape),
+        int(k_tile_count * k_tile),
+        int(normal_width),
     )
-    padded_basis_host[:kernel_size, : basis_kernels.shape[0]] = (
-        basis_kernels[:, ::-1, ::-1].reshape(basis_kernels.shape[0], -1).T
-    )
-    padded_basis = cp.asarray(padded_basis_host)
     partial_normal = cp.empty(
         (block_count, column_count, column_count + 1),
         dtype=cp.float64,
